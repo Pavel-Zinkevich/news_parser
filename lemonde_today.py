@@ -10,73 +10,83 @@ import re
 import sys
 import os
 import argparse
+import sqlite3
+import datetime
 from datetime import date
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-import sqlite3
 
-# Selenium imports (optional, used when available)
+# Optional selenium support
 try:
     from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
     from webdriver_manager.chrome import ChromeDriverManager
     SELENIUM_AVAILABLE = True
 except Exception:
     SELENIUM_AVAILABLE = False
 
+# Optional transformers (for translation)
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
 
+# Optional torch (transformers backend) and sacremoses for faster tokenization
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+try:
+    from sacremoses import MosesTokenizer
+    SACREMOSES_AVAILABLE = True
+except Exception:
+    SACREMOSES_AVAILABLE = False
+
+# Constants
 BASE_URL = "https://www.lemonde.fr/actualite-en-continu/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; lemonde-scraper/1.0; +https://example.org)"
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 }
 
 TODAY = date.today()
-TODAY_STR = TODAY.strftime("%Y/%m/%d")  # e.g. 2026/03/26
+TODAY_STR = TODAY.strftime("%Y/%m/%d")
 
-APOSTROPHE_VARIANTS = ["aujourd'hui", "aujourd’hui"]
-PUB_REGEX = re.compile(r"Publié\s+(?:aujourd['’]hui|le)\b", re.IGNORECASE)
+APOSTROPHE_VARIANTS = ["aujourd'hui", "aujourd’hui", "aujourd’", "aujourd"]
 
 SUBSCRIBER_KEYWORDS = [
-    "Article réservé",
-    "Article réservé à nos abonnés",
-    "Article réservé aux abonnés",
-    "Réservé aux abonnés",
-    "Réservé à nos abonnés",
-    "Article réservé aux abonnés",
-    "Article réservé aux abonnés",
+    "abonné", "abonnés", "réservé aux abonnés", "pour les abonnés", "payant", "premium"
 ]
 
 
-def is_subscriber_only(text: str) -> bool:
-    if not text:
-        return False
-    lower = text.lower()
-    for kw in SUBSCRIBER_KEYWORDS:
-        if kw.lower() in lower:
-            return True
-    return False
-
-
-def find_pub_text(ancestor) -> str:
-    """Return any nearby publication text (e.g. 'Publié aujourd'hui à 12h35...') if present."""
-    if not ancestor:
+def find_pub_text(tag) -> str:
+    """Find a publication snippet (e.g. 'Publié aujourd'hui à 12h35') inside the given tag."""
+    if tag is None:
         return ""
-    txt = ancestor.get_text(separator=" ", strip=True)
-    # Look for 'Publié ...' or 'Publié aujourd'hui' variants
-    m = re.search(r"Publié[^•\n\r]{0,120}", txt, flags=re.IGNORECASE)
+    try:
+        txt = tag.get_text(" ", strip=True)
+    except Exception:
+        txt = str(tag)
+    m = re.search(r"Publié\s+[^\n]+", txt, re.IGNORECASE)
     if m:
         return m.group(0)
-    # Fallback: look specifically for today's mention
     for v in APOSTROPHE_VARIANTS:
         if v.lower() in txt.lower():
             return txt
     return ""
+
+
+def is_subscriber_only(txt: str) -> bool:
+    if not txt:
+        return False
+    t = txt.lower()
+    return any(k in t for k in SUBSCRIBER_KEYWORDS)
 
 
 def gather_articles(html: str, base: str = BASE_URL):
@@ -372,6 +382,138 @@ def process_free_articles(articles, use_selenium=False):
     return articles_data
 
 
+###############################################################################
+# Translation helpers
+###############################################################################
+
+
+def chunk_text_by_tokens(text: str, tokenizer, max_tokens: int = 500, use_sacremoses: bool = False):
+    """Split `text` into chunks where each chunk has <= max_tokens tokens (according to `tokenizer`).
+
+    Strategy:
+    - Split text into sentence-like fragments using punctuation.
+    - Accumulate fragments until token count would exceed max_tokens.
+    - If a single fragment is longer than max_tokens, fall back to word-based splitting.
+    """
+    if not text:
+        return []
+
+    # simple sentence splitter (keeps punctuation)
+    frags = re.split(r'(?<=[\.\!\?…])\s+', text)
+
+    chunks = []
+    cur = []
+    cur_count = 0
+
+    # helper to count tokens for a fragment
+    def token_count_for(s: str) -> int:
+        if not s:
+            return 0
+        if use_sacremoses and SACREMOSES_AVAILABLE:
+            # sacremoses provides a fast word tokenizer; approximate token count
+            mt = MosesTokenizer()
+            toks = mt.tokenize(s, return_str=False)
+            return len(toks)
+        # fallback: use tokenizer.encode (exclude special tokens)
+        try:
+            ids = tokenizer.encode(s, add_special_tokens=False)
+            return len(ids)
+        except Exception:
+            # worst-case fallback: approximate by word count
+            return len(s.split())
+
+    for frag in frags:
+        cnt = token_count_for(frag)
+        if cnt > max_tokens:
+            # fragment itself too large: split by words
+            words = frag.split()
+            sub = []
+            sub_count = 0
+            for w in words:
+                w_cnt = token_count_for(w)
+                if sub_count + w_cnt <= max_tokens:
+                    sub.append(w)
+                    sub_count += w_cnt
+                else:
+                    if sub:
+                        chunks.append(" ".join(sub))
+                    sub = [w]
+                    sub_count = w_cnt
+            if sub:
+                # append remainder
+                if cur_count + sub_count <= max_tokens and cur:
+                    cur.append(" ".join(sub))
+                    cur_count += sub_count
+                else:
+                    if cur:
+                        chunks.append(" ".join(cur))
+                    chunks.append(" ".join(sub))
+                    cur = []
+                    cur_count = 0
+            continue
+
+        # normal fragment
+        if cur_count + cnt <= max_tokens:
+            cur.append(frag)
+            cur_count += cnt
+        else:
+            # flush current
+            if cur:
+                chunks.append(" ".join(cur))
+            cur = [frag]
+            cur_count = cnt
+
+    if cur:
+        chunks.append(" ".join(cur))
+
+    return chunks
+
+
+def translate_in_chunks(text: str, tokenizer, model, max_tokens: int = 500, device: str = "cpu", use_sacremoses: bool = False) -> str:
+    """Translate `text` by splitting into token-sized chunks and translating each.
+
+    Returns the concatenated translation string.
+    """
+    if not text:
+        return ""
+
+    # Prepare device
+    use_cuda = TORCH_AVAILABLE and torch.cuda.is_available()
+    dev = torch.device("cuda") if use_cuda and device == "cuda" else torch.device("cpu")
+    try:
+        model.to(dev)
+    except Exception:
+        pass
+
+    chunks = chunk_text_by_tokens(text, tokenizer, max_tokens=max_tokens, use_sacremoses=use_sacremoses)
+    translations = []
+
+    for i, chunk in enumerate(chunks):
+        try:
+            # tokenizers will add special tokens and handle truncation
+            inputs = tokenizer(chunk, return_tensors="pt", truncation=True)
+            if TORCH_AVAILABLE:
+                inputs = {k: v.to(dev) for k, v in inputs.items()}
+            outputs = model.generate(**inputs, max_length= inputs['input_ids'].shape[1] * 4 + 50)
+            translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            translations.append(translated)
+        except Exception as e:
+            # If a chunk fails, try a safer fallback: character-based smaller chunks
+            safe_parts = [chunk[i:i+1000] for i in range(0, len(chunk), 1000)]
+            for sp in safe_parts:
+                try:
+                    sin = tokenizer(sp, return_tensors="pt", truncation=True)
+                    if TORCH_AVAILABLE:
+                        sin = {k: v.to(dev) for k, v in sin.items()}
+                    out = model.generate(**sin, max_length= sin['input_ids'].shape[1] * 4 + 50)
+                    translations.append(tokenizer.decode(out[0], skip_special_tokens=True))
+                except Exception as e2:
+                    # Last resort: append empty string and continue
+                    translations.append("")
+    # join translated parts with double newlines to preserve paragraph breaks
+    return "\n\n".join(filter(None, translations))
+
+
 def init_db(db_path: str = "articles.db"):
     """Create SQLite DB and articles table if not exists."""
     conn = sqlite3.connect(db_path)
@@ -389,6 +531,53 @@ def init_db(db_path: str = "articles.db"):
     )
     conn.commit()
     conn.close()
+
+
+def init_translation_db(db_path: str = "translation.db"):
+    """Create translation DB and translations table if not exists."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    # enable foreign keys
+    cur.execute("PRAGMA foreign_keys = ON;")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS translations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER,
+            title TEXT,
+            url TEXT,
+            translated_text TEXT,
+            FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def translation_exists(article_id: int, url: str, db_path: str = "translation.db") -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM translations WHERE article_id = ? OR url = ? LIMIT 1", (article_id, url))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def insert_translation(article_id: int, title: str, url: str, translated_text: str, db_path: str = "translation.db") -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO translations (article_id, title, url, translated_text) VALUES (?, ?, ?, ?)",
+            (article_id, title, url, translated_text),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
 
 
 def article_exists(title: str, url: str, db_path: str = "articles.db") -> bool:
@@ -409,11 +598,23 @@ def insert_article(article: dict, db_path: str = "articles.db") -> bool:
             (article.get("title"), article.get("url"), article.get("published_at"), article.get("text")),
         )
         conn.commit()
-        return True
+        return cur.lastrowid
     except sqlite3.IntegrityError:
-        return False
+        # return existing id if present
+        cur.execute("SELECT id FROM articles WHERE url = ?", (article.get("url"),))
+        row = cur.fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
+
+
+def get_article_id(url: str, db_path: str = "articles.db") -> int | None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM articles WHERE url = ? LIMIT 1", (url,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def main():
@@ -428,6 +629,11 @@ def main():
         "--db-path",
         default="articles.db",
         help="SQLite database path (default: articles.db)"
+    )
+    parser.add_argument(
+        "--use-sacremoses",
+        action="store_true",
+        help="Use sacremoses for faster/approximate token counting when chunking (optional)"
     )
     args = parser.parse_args()
 
@@ -493,18 +699,76 @@ def main():
         print("Fetching full text for free articles...")
         articles_data = process_free_articles(articles, use_selenium=use_selenium)
         print(f"\nFetched {len(articles_data)} free articles with text:")
-        # Initialize DB and insert new articles
+        # Initialize DBs
         init_db(args.db_path)
+        init_translation_db()
+
+        # initialize translation model lazily (only if transformers available)
+        model = None
+        tokenizer = None
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                model_name = "Helsinki-NLP/opus-mt-fr-en"
+                print(f"Loading translation model {model_name}...")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            except Exception as e:
+                print("Failed to load translation model:", e, file=sys.stderr)
+                model = None
+                tokenizer = None
+
         for a in articles_data:
             print(f"- {a['title']} ({a['published_at']}) [{len(a['text'])} chars]")
+            # determine article id (insert if new)
             if article_exists(a.get("title"), a.get("url"), db_path=args.db_path):
-                print(f"  -> Skipping (already in DB): {a.get('url')}")
-                continue
-            ok = insert_article(a, db_path=args.db_path)
-            if ok:
-                print(f"  -> Inserted into DB: {a.get('url')}")
+                art_id = get_article_id(a.get("url"), db_path=args.db_path)
+                print(f"  -> Skipping insert (already in DB): {a.get('url')} (id={art_id})")
             else:
-                print(f"  -> Failed to insert (duplicate?): {a.get('url')}")
+                art_id = insert_article(a, db_path=args.db_path)
+                if art_id:
+                    print(f"  -> Inserted into DB: {a.get('url')} (id={art_id})")
+                else:
+                    print(f"  -> Failed to insert (duplicate?): {a.get('url')}")
+
+            if art_id is None:
+                continue
+
+            # Skip if translation already exists
+            if translation_exists(art_id, a.get("url")):
+                print(f"  -> Translation already exists for article id={art_id}")
+                continue
+
+            # If transformers not available or model failed to load, skip translation
+            if not TRANSFORMERS_AVAILABLE or model is None or tokenizer is None:
+                print("  -> Transformers not available or model failed to load; skipping translation.")
+                continue
+
+            # perform translation (chunking long texts)
+            try:
+                text = a.get("text") or ""
+                translated_text = translate_in_chunks(
+                    text,
+                    tokenizer,
+                    model,
+                    max_tokens=500,
+                    device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"),
+                    use_sacremoses=args.use_sacremoses,
+                )
+                # translate title
+                if a.get('title'):
+                    t_inputs = tokenizer(a.get('title'), return_tensors='pt', truncation=True)
+                    t_out = model.generate(**t_inputs, max_length=128)
+                    translated_title = tokenizer.decode(t_out[0], skip_special_tokens=True)
+                else:
+                    translated_title = ""
+
+                ok = insert_translation(art_id, translated_title, a.get("url"), translated_text)
+                if ok:
+                    print(f"  -> Inserted translation for article id={art_id}")
+                else:
+                    print(f"  -> Failed to insert translation for article id={art_id}")
+            except Exception as e:
+                print(f"  -> Translation failed for article id={art_id}: {e}")
 
 
 if __name__ == "__main__":

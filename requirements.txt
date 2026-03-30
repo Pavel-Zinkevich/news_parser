@@ -3,3 +3,8 @@ beautifulsoup4>=4.9
 lxml>=4.0
 selenium>=4.10
 webdriver-manager>=4.0
+transformers>=4.0
+sentencepiece>=0.1
+# Optional, speeds up tokenization/chunk heuristics
+sacremoses>=0.0.53
+torch  # PyTorch, required for Transformers models
