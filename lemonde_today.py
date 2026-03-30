@@ -555,6 +555,90 @@ def init_translation_db(db_path: str = "translation.db"):
     conn.close()
 
 
+def get_translation_id_by_article(article_id: int, url: str, db_path: str = "translation.db") -> int | None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM translations WHERE article_id = ? OR url = ? LIMIT 1", (article_id, url))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_translation_text(translation_id: int, db_path: str = "translation.db") -> dict | None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, url, translated_text FROM translations WHERE id = ? LIMIT 1", (translation_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "title": row[1], "url": row[2], "translated_text": row[3]}
+
+
+def list_translations(db_path: str = "translation.db"):
+    """Yield all translations as dicts from the translations DB."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, article_id, title, url, translated_text FROM translations")
+    rows = cur.fetchall()
+    conn.close()
+    for row in rows:
+        yield {"id": row[0], "article_id": row[1], "title": row[2], "url": row[3], "translated_text": row[4]}
+
+
+def paraphrase_only_flow(args):
+    """Process all translations in translation.db and create paraphrases for missing ones."""
+    print("Running paraphrase-only mode: scanning translations and generating paraphrases...")
+    init_paraphrase_db()
+
+    if not TRANSFORMERS_AVAILABLE:
+        print("Transformers not available; cannot paraphrase. Install 'transformers' and restart.")
+        return
+
+    # load paraphrase model once
+    paraphrase_model_name = "Vamsi/T5_Paraphrase_Paws"
+    try:
+        print(f"Loading paraphrase model {paraphrase_model_name}...")
+        paraphrase_tokenizer = AutoTokenizer.from_pretrained(paraphrase_model_name)
+        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(paraphrase_model_name)
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            paraphrase_model.to(torch.device("cuda"))
+    except Exception as e:
+        print(f"Failed to load paraphrase model: {e}")
+        return
+
+    for t in list_translations():
+        t_id = t.get("id")
+        url = t.get("url")
+        print(f"Processing translation id={t_id} url={url}")
+        if paraphrase_exists(t_id, url):
+            print(f"  -> Paraphrase exists for translation id={t_id}; skipping")
+            continue
+        text = t.get("translated_text") or ""
+        if not text:
+            print(f"  -> No translated text for id={t_id}; skipping")
+            continue
+        try:
+            paraphrased = translate_in_chunks(
+                text,
+                paraphrase_tokenizer,
+                paraphrase_model,
+                max_tokens=200,
+                device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"),
+                use_sacremoses=args.use_sacremoses,
+            )
+        except Exception as e:
+            print(f"  -> Paraphrasing failed for translation id={t_id}: {e}")
+            paraphrased = ""
+
+        if paraphrased:
+            ok = insert_paraphrase(t_id, t.get("title"), url, paraphrased)
+            if ok:
+                print(f"  -> Inserted paraphrase for translation id={t_id}")
+            else:
+                print(f"  -> Failed to insert paraphrase for translation id={t_id}")
+
+
 def translation_exists(article_id: int, url: str, db_path: str = "translation.db") -> bool:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -571,6 +655,52 @@ def insert_translation(article_id: int, title: str, url: str, translated_text: s
         cur.execute(
             "INSERT INTO translations (article_id, title, url, translated_text) VALUES (?, ?, ?, ?)",
             (article_id, title, url, translated_text),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def init_paraphrase_db(db_path: str = "paraphrased_translation.db"):
+    """Create paraphrased translations DB and paraphrases table if not exists."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA foreign_keys = ON;")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS paraphrases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            translation_id INTEGER,
+            title TEXT,
+            url TEXT,
+            paraphrased_text TEXT,
+            FOREIGN KEY(translation_id) REFERENCES translations(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def paraphrase_exists(translation_id: int, url: str, db_path: str = "paraphrased_translation.db") -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM paraphrases WHERE translation_id = ? OR url = ? LIMIT 1", (translation_id, url))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def insert_paraphrase(translation_id: int, title: str, url: str, paraphrased_text: str, db_path: str = "paraphrased_translation.db") -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO paraphrases (translation_id, title, url, paraphrased_text) VALUES (?, ?, ?, ?)",
+            (translation_id, title, url, paraphrased_text),
         )
         conn.commit()
         return True
@@ -635,7 +765,17 @@ def main():
         action="store_true",
         help="Use sacremoses for faster/approximate token counting when chunking (optional)"
     )
+    parser.add_argument(
+        "--paraphrase-only",
+        action="store_true",
+        help="Only run the paraphrase pipeline on existing translations in translation.db and exit"
+    )
     args = parser.parse_args()
+
+    # If paraphrase-only mode requested, run paraphrase-only flow and exit
+    if getattr(args, "paraphrase_only", False):
+        paraphrase_only_flow(args)
+        return
 
     # Allow cookie to be passed via --cookie or environment variable LEMONDE_COOKIE
     cookie_val = args.cookie or os.environ.get("LEMONDE_COOKIE")
@@ -769,6 +909,72 @@ def main():
                     print(f"  -> Failed to insert translation for article id={art_id}")
             except Exception as e:
                 print(f"  -> Translation failed for article id={art_id}: {e}")
+
+            # After translation inserted (or existing), attempt paraphrase
+            try:
+                # get translation id (either existing or newly inserted)
+                trans_id = get_translation_id_by_article(art_id, a.get("url"))
+                if trans_id is None:
+                    print(f"  -> Cannot find translation id for article id={art_id}; skipping paraphrase")
+                    continue
+
+                # ensure paraphrase DB exists
+                init_paraphrase_db()
+
+                if paraphrase_exists(trans_id, a.get("url")):
+                    print(f"  -> Paraphrase already exists for translation id={trans_id}")
+                    continue
+
+                # fetch translation text
+                trans_row = get_translation_text(trans_id)
+                if not trans_row or not trans_row.get("translated_text"):
+                    print(f"  -> No translated text found for translation id={trans_id}; skipping paraphrase")
+                    continue
+
+                # initialize paraphrase model lazily
+                paraphrase_model = None
+                paraphrase_tokenizer = None
+                paraphrase_model_name = "Vamsi/T5_Paraphrase_Paws"
+                if TRANSFORMERS_AVAILABLE:
+                    try:
+                        print(f"  -> Loading paraphrase model {paraphrase_model_name}...")
+                        paraphrase_tokenizer = AutoTokenizer.from_pretrained(paraphrase_model_name)
+                        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(paraphrase_model_name)
+                        # move to GPU if available
+                        if TORCH_AVAILABLE and torch.cuda.is_available():
+                            paraphrase_model.to(torch.device("cuda"))
+                    except Exception as e:
+                        print(f"  -> Failed to load paraphrase model: {e}")
+                        paraphrase_model = None
+                        paraphrase_tokenizer = None
+
+                if paraphrase_model is None or paraphrase_tokenizer is None:
+                    print("  -> Paraphrase model unavailable; skipping paraphrase.")
+                    continue
+
+                # paraphrase the translated text in chunks
+                paraphrased = ""
+                try:
+                    paraphrased = translate_in_chunks(
+                        trans_row.get("translated_text"),
+                        paraphrase_tokenizer,
+                        paraphrase_model,
+                        max_tokens=200,
+                        device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"),
+                        use_sacremoses=args.use_sacremoses,
+                    )
+                except Exception as e:
+                    print(f"  -> Paraphrasing failed for translation id={trans_id}: {e}")
+                    paraphrased = ""
+
+                if paraphrased:
+                    okp = insert_paraphrase(trans_id, trans_row.get("title"), trans_row.get("url"), paraphrased)
+                    if okp:
+                        print(f"  -> Inserted paraphrase for translation id={trans_id}")
+                    else:
+                        print(f"  -> Failed to insert paraphrase for translation id={trans_id}")
+            except Exception as e:
+                print(f"  -> Paraphrase pipeline error for article id={art_id}: {e}")
 
 
 if __name__ == "__main__":

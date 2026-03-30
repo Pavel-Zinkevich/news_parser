@@ -5,6 +5,8 @@ selenium>=4.10
 webdriver-manager>=4.0
 transformers>=4.0
 sentencepiece>=0.1
+protobuf>=4.0          # required for sentencepiece models
+tiktoken>=0.4.0        # fallback tokenizer for paraphrase models
 # Optional, speeds up tokenization/chunk heuristics
 sacremoses>=0.0.53
-torch  # PyTorch, required for Transformers models
+torch                  # PyTorch, required for Transformers models
