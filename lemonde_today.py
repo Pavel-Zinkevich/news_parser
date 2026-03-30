@@ -185,6 +185,20 @@ def _extract_time_from_pub_text(pub_text: str) -> str:
     return f"{hh}:{mm}"
 
 
+def extract_date_from_url(url: str) -> str:
+    """Extract YYYY-MM-DD from a URL containing /YYYY/MM/DD/.
+
+    Returns empty string if not found.
+    """
+    if not url:
+        return ""
+    m = re.search(r"/(\d{4})/(\d{2})/(\d{2})/", url)
+    if not m:
+        return ""
+    y, mo, d = m.group(1), m.group(2), m.group(3)
+    return f"{y}-{mo}-{d}"
+
+
 def _clean_text(soup: BeautifulSoup) -> str:
     # remove scripts, styles and common ad/subscribe blocks
     for sel in soup(["script", "style", "noscript", "iframe"]):
@@ -271,7 +285,19 @@ def process_free_articles(articles, use_selenium=False):
         url = a.get("url")
         title = a.get("title")
         pub_text = a.get("pub_text", "")
-        published_at = _extract_time_from_pub_text(pub_text)
+
+        # Extract date from URL and time from pub_text, then combine
+        date_str = extract_date_from_url(url)
+        time_str = _extract_time_from_pub_text(pub_text)
+        published_at = ""
+        if date_str and time_str:
+            published_at = f"{date_str} {time_str}"
+        elif date_str:
+            # keep date; may fill time from <time> tag later
+            published_at = date_str
+        else:
+            # fallback to old behavior (time-only)
+            published_at = time_str
 
         html = None
         if driver:
@@ -293,8 +319,12 @@ def process_free_articles(articles, use_selenium=False):
 
         soup = BeautifulSoup(html, "lxml")
 
-        # If published_at empty, try to extract from <time>
-        if not published_at:
+        # If published_at does not include a date/time, try to extract from <time>
+        # Prefer filling missing time when we have a date from URL
+        try_time_fill = True
+        if published_at and re.match(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}", str(published_at)):
+            try_time_fill = False
+        if try_time_fill:
             try:
                 t = soup.find("time")
                 if t:
@@ -304,12 +334,25 @@ def process_free_articles(articles, use_selenium=False):
                         # ISO datetime: 2026-03-26T12:35:00+01:00
                         m = re.search(r"T(\d{2}:\d{2})", dt)
                         if m:
-                            published_at = m.group(1)
+                            time_from_time_tag = m.group(1)
+                            if date_str:
+                                published_at = f"{date_str} {time_from_time_tag}"
+                            else:
+                                published_at = time_from_time_tag
                     else:
                         # fallback parse hh'h'mm
-                        published_at = _extract_time_from_pub_text(dt)
+                        time_from_dt = _extract_time_from_pub_text(dt)
+                        if time_from_dt:
+                            if date_str:
+                                published_at = f"{date_str} {time_from_dt}"
+                            else:
+                                published_at = time_from_dt
             except Exception:
                 pass
+
+        # If published_at currently equals date only (YYYY-MM-DD), normalize to YYYY-MM-DD 00:00
+        if published_at and re.match(r"^\d{4}-\d{2}-\d{2}$", str(published_at)):
+            published_at = f"{published_at} 00:00"
 
         text = _clean_text(soup)
 
