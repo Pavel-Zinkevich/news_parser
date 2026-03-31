@@ -15,6 +15,9 @@ __pycache__/
 .vscode/
 .DS_Store
 
+# Environment file (contains secrets)
+.env
+
 # Python package build artifacts
 build/
 dist/
