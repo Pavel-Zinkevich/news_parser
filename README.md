@@ -13,7 +13,9 @@
 This repository includes a set of small scripts that:
 
 - 🔎 **Scrape today's articles** from Le Monde’s continuously updated news feed  
-- 🧠 **Translate & paraphrase text** into English (optional)  
+- 🧠 **Translate & paraphrase text** into English using Hugging Face transformers models  
+  - Translation model: `Helsinki-NLP/opus-mt-fr-en`  
+  - Paraphrase model: `Vamsi/T5_Paraphrase_Paws`  
 - 📲 **Send approved paraphrased news** to your Telegram channel via an approval workflow  
 - 🛠️ Works with SQLite for storing articles & translations  
 
@@ -26,7 +28,7 @@ This repository includes a set of small scripts that:
 ✨ **Main Highlights**
 
 - 🗞️ Fetches fresh articles from Le Monde  
-- 🔁 Translation + paraphrase workflow  
+- 🔁 Translation + paraphrase workflow using transformers models  
 - 📬 Telegram admin review & publication  
 - 🧰 CLI scripts for automation
 
@@ -36,7 +38,7 @@ This repository includes a set of small scripts that:
 
 | Script | Purpose |
 | ------ | ------- |
-| `lemonde_today.py` | Fetch + translate + paraphrase articles |
+| `lemonde_today.py` | Fetch + translate + paraphrase articles using transformers (`Helsinki-NLP/opus-mt-fr-en` and `Vamsi/T5_Paraphrase_Paws`) |
 | `send_last_paraphrase.py` | Send the latest paraphrased message for approval |
 | `send_pending_news.py` | Batch-send paraphrases awaiting approval |
 | `requirements.txt` | Dependencies required by the scripts |
@@ -48,7 +50,8 @@ This repository includes a set of small scripts that:
 Make sure you have:
 
 - 🐍 **Python 3.10+**  
-- A Bash‑compatible terminal (Linux / macOS / Windows with WSL)
+- A Bash‑compatible terminal (Linux / macOS / Windows with WSL)  
+- 🤗 **Hugging Face Transformers library** (installed via `pip install transformers`)
 
 ---
 
@@ -89,8 +92,8 @@ Add optional flags:
 
 ```bash
 python3 lemonde_today.py --fetch         # Fetch full text
-python3 lemonde_today.py --translate     # Translate only
-python3 lemonde_today.py --paraphrase-only
+python3 lemonde_today.py --translate     # Translate only using transformers (Helsinki-NLP/opus-mt-fr-en)
+python3 lemonde_today.py --paraphrase-only  # Paraphrase using Vamsi/T5_Paraphrase_Paws
 ```
 
 ### 📨 Review & Send to Telegram
