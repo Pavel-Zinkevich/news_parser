@@ -17,6 +17,25 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+import time
+import threading
+import asyncio
+import json
+
+# telegram imports (optional)
+try:
+    from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+    from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
+    TELEGRAM_AVAILABLE = True
+except Exception:
+    TELEGRAM_AVAILABLE = False
+
+# Globals for telegram app
+TELEGRAM_APP = None
+TELEGRAM_LOOP = None
+TELEGRAM_THREAD = None
+TELEGRAM_ADMIN_ID = None
+TELEGRAM_CHANNEL_ID = None
 
 # Optional selenium support
 try:
@@ -632,9 +651,37 @@ def paraphrase_only_flow(args):
             paraphrased = ""
 
         if paraphrased:
-            ok = insert_paraphrase(t_id, t.get("title"), url, paraphrased)
-            if ok:
-                print(f"  -> Inserted paraphrase for translation id={t_id}")
+            p_id = insert_paraphrase(t_id, t.get("title"), url, paraphrased)
+            if p_id:
+                print(f"  -> Inserted paraphrase for translation id={t_id} (paraphrase_id={p_id})")
+                # schedule telegram approval message if requested
+                if getattr(args, "telegram", False) and TELEGRAM_AVAILABLE:
+                    token = getattr(args, "telegram_token", None) or os.environ.get("TELEGRAM_BOT_TOKEN")
+                    try:
+                        admin_id = int(getattr(args, "telegram_admin_id", os.environ.get("TELEGRAM_ADMIN_ID") or 0) or 0)
+                    except Exception:
+                        admin_id = 0
+                    try:
+                        channel_id = int(getattr(args, "telegram_channel_id", os.environ.get("TELEGRAM_CHANNEL_ID") or 0) or 0)
+                    except Exception:
+                        channel_id = 0
+                    if token and admin_id and channel_id:
+                        start_telegram_app(token, admin_id, channel_id)
+                        if TELEGRAM_LOOP:
+                            try:
+                                # avoid re-sending if previously scheduled
+                                p_row = get_paraphrase(p_id)
+                                if not p_row or not p_row.get("sent_for_approval"):
+                                    # mark as sent to avoid duplicate scheduling on restarts
+                                    try:
+                                        mark_paraphrase_sent_for_approval(p_id)
+                                    except Exception:
+                                        pass
+                                    asyncio.run_coroutine_threadsafe(_send_approval_message(p_id, t.get("title"), paraphrased), TELEGRAM_LOOP)
+                                else:
+                                    print(f"Paraphrase id={p_id} already sent for approval; skipping scheduling")
+                            except Exception as e:
+                                print("Failed to schedule telegram approval message:", e)
             else:
                 print(f"  -> Failed to insert paraphrase for translation id={t_id}")
 
@@ -683,6 +730,39 @@ def init_paraphrase_db(db_path: str = "paraphrased_translation.db"):
     )
     conn.commit()
     conn.close()
+    # ensure approved column exists for workflow
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE paraphrases ADD COLUMN approved INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        # likely column already exists
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    # ensure sent_for_approval column exists (tracks whether we've sent the paraphrase to admin)
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(paraphrases)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'sent_for_approval' not in cols:
+            cur.execute("ALTER TABLE paraphrases ADD COLUMN sent_for_approval BOOLEAN DEFAULT 0")
+            conn.commit()
+            print(f"Added column 'sent_for_approval' to {db_path}")
+        else:
+            print(f"Column 'sent_for_approval' already exists in {db_path}")
+    except Exception as e:
+        print(f"Failed to ensure 'sent_for_approval' column: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def paraphrase_exists(translation_id: int, url: str, db_path: str = "paraphrased_translation.db") -> bool:
@@ -703,11 +783,201 @@ def insert_paraphrase(translation_id: int, title: str, url: str, paraphrased_tex
             (translation_id, title, url, paraphrased_text),
         )
         conn.commit()
-        return True
+        return cur.lastrowid
     except sqlite3.IntegrityError:
+        # try to return existing id
+        cur.execute("SELECT id FROM paraphrases WHERE translation_id = ? OR url = ? LIMIT 1", (translation_id, url))
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def mark_paraphrase_approved(paraphrase_id: int, db_path: str = "paraphrased_translation.db") -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE paraphrases SET approved = 1 WHERE id = ?", (paraphrase_id,))
+        conn.commit()
+        return True
+    except Exception:
         return False
     finally:
         conn.close()
+
+
+def mark_paraphrase_sent_for_approval(paraphrase_id: int, db_path: str = "paraphrased_translation.db") -> bool:
+    """Mark the paraphrase as having been sent for approval (sent_for_approval = 1)."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE paraphrases SET sent_for_approval = 1 WHERE id = ?", (paraphrase_id,))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def get_paraphrase(paraphrase_id: int, db_path: str = "paraphrased_translation.db") -> dict | None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, translation_id, title, url, paraphrased_text, approved, sent_for_approval FROM paraphrases WHERE id = ? LIMIT 1", (paraphrase_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "translation_id": row[1], "title": row[2], "url": row[3], "paraphrased_text": row[4], "approved": row[5], "sent_for_approval": row[6]}
+
+
+def _chunk_text_by_chars(text: str, min_size: int = 200, max_size: int = 500):
+    """Split text into chunks of roughly min_size..max_size characters, preferring paragraph/sentence breaks."""
+    if not text:
+        return []
+    # split by paragraphs first
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    cur = ""
+    for p in parts:
+        if not cur:
+            cur = p
+        else:
+            if len(cur) + 2 + len(p) <= max_size:
+                cur = cur + "\n\n" + p
+            else:
+                if len(cur) >= min_size:
+                    chunks.append(cur)
+                    cur = p
+                else:
+                    # cur too small; try to append until at least min_size
+                    cur = cur + "\n\n" + p
+                    if len(cur) >= min_size:
+                        chunks.append(cur)
+                        cur = ""
+    if cur:
+        # may still be long; break by sentences
+        if len(cur) > max_size:
+            sents = re.split(r'(?<=[\.\!\?…])\s+', cur)
+            cur2 = ""
+            for s in sents:
+                if not cur2:
+                    cur2 = s
+                elif len(cur2) + 1 + len(s) <= max_size:
+                    cur2 = cur2 + " " + s
+                else:
+                    chunks.append(cur2)
+                    cur2 = s
+            if cur2:
+                chunks.append(cur2)
+        else:
+            chunks.append(cur)
+    return chunks
+
+
+async def _send_approval_message(paraphrase_id: int, title: str, paraphrased_text: str):
+    """Coroutine that sends the approval message (title + chunked paraphrase) to admin chat with inline buttons."""
+    global TELEGRAM_APP, TELEGRAM_ADMIN_ID
+    if not TELEGRAM_APP or TELEGRAM_ADMIN_ID is None:
+        return
+    kb = [
+        [InlineKeyboardButton("✅ Yes", callback_data=f"approve:{paraphrase_id}"), InlineKeyboardButton("❌ No", callback_data=f"reject:{paraphrase_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(kb)
+    try:
+        init_msg = await TELEGRAM_APP.bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=f"Review article: {title}", reply_markup=reply_markup)
+    except Exception as e:
+        print("Failed to send approval message:", e)
+        return
+
+    # send paraphrased text in chunks
+    chunks = _chunk_text_by_chars(paraphrased_text, min_size=200, max_size=500)
+    if not chunks:
+        return
+    for c in chunks:
+        try:
+            await TELEGRAM_APP.bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=c, reply_to_message_id=init_msg.message_id)
+            await asyncio.sleep(0.8)
+        except Exception:
+            # continue on failures
+            pass
+
+
+def start_telegram_app(token: str, admin_chat_id: int, channel_id: int):
+    """Start the telegram Application in a background thread. Stores globals for scheduling coroutines."""
+    global TELEGRAM_APP, TELEGRAM_LOOP, TELEGRAM_THREAD, TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL_ID
+    if not TELEGRAM_AVAILABLE:
+        print("python-telegram-bot not available; install it to enable Telegram workflow")
+        return False
+
+    if TELEGRAM_APP:
+        return True
+
+    TELEGRAM_ADMIN_ID = admin_chat_id
+    TELEGRAM_CHANNEL_ID = channel_id
+
+    app = ApplicationBuilder().token(token).build()
+
+    async def _callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # expects callback_data like 'approve:123' or 'reject:123'
+        data = update.callback_query.data or ""
+        try:
+            action, sid = data.split(":", 1)
+            pid = int(sid)
+        except Exception:
+            await update.callback_query.answer("Invalid callback data")
+            return
+
+        if action == "approve":
+            p = get_paraphrase(pid)
+            if not p:
+                await update.callback_query.answer("Paraphrase not found")
+                return
+            text = (p.get("title") or "") + "\n\n" + (p.get("paraphrased_text") or "")
+            parts = [text[i:i+3800] for i in range(0, len(text), 3800)]
+            for part in parts:
+                await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=part)
+            mark_paraphrase_approved(pid)
+            await update.callback_query.answer("Approved and posted")
+            try:
+                await update.callback_query.message.edit_reply_markup(None)
+            except Exception:
+                pass
+        elif action == "reject":
+            await update.callback_query.answer("Rejected")
+            try:
+                await update.callback_query.message.edit_reply_markup(None)
+            except Exception:
+                pass
+
+    app.add_handler(CallbackQueryHandler(_callback_router))
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        nonlocal_app = app
+        # store loop and app for scheduling
+        globals()['TELEGRAM_LOOP'] = loop
+        globals()['TELEGRAM_APP'] = nonlocal_app
+        try:
+            nonlocal_app.run_polling()
+        except Exception as e:
+            print("Telegram app polling stopped:", e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    TELEGRAM_THREAD = t
+    t.start()
+    time.sleep(1)
+    return True
+
+
+def stop_telegram_app():
+    global TELEGRAM_APP
+    if TELEGRAM_APP:
+        try:
+            TELEGRAM_APP.stop()
+        except Exception:
+            pass
 
 
 def article_exists(title: str, url: str, db_path: str = "articles.db") -> bool:
@@ -769,6 +1039,23 @@ def main():
         "--paraphrase-only",
         action="store_true",
         help="Only run the paraphrase pipeline on existing translations in translation.db and exit"
+    )
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Enable Telegram approval workflow (requires telegram token/admin/channel)"
+    )
+    parser.add_argument(
+        "--telegram-token",
+        help="Telegram bot token (or set TELEGRAM_BOT_TOKEN env)"
+    )
+    parser.add_argument(
+        "--telegram-admin-id",
+        help="Telegram admin chat id (your user id) or set TELEGRAM_ADMIN_ID env",
+    )
+    parser.add_argument(
+        "--telegram-channel-id",
+        help="Target Telegram channel id where approved posts are sent (or set TELEGRAM_CHANNEL_ID env)",
     )
     args = parser.parse_args()
 
@@ -968,9 +1255,35 @@ def main():
                     paraphrased = ""
 
                 if paraphrased:
-                    okp = insert_paraphrase(trans_id, trans_row.get("title"), trans_row.get("url"), paraphrased)
-                    if okp:
-                        print(f"  -> Inserted paraphrase for translation id={trans_id}")
+                    p_id = insert_paraphrase(trans_id, trans_row.get("title"), trans_row.get("url"), paraphrased)
+                    if p_id:
+                        print(f"  -> Inserted paraphrase for translation id={trans_id} (paraphrase_id={p_id})")
+                        # send approval request via Telegram if enabled
+                        if getattr(args, "telegram", False) and TELEGRAM_AVAILABLE:
+                            token = getattr(args, "telegram_token", None) or os.environ.get("TELEGRAM_BOT_TOKEN")
+                            try:
+                                admin_id = int(getattr(args, "telegram_admin_id", os.environ.get("TELEGRAM_ADMIN_ID") or 0) or 0)
+                            except Exception:
+                                admin_id = 0
+                            try:
+                                channel_id = int(getattr(args, "telegram_channel_id", os.environ.get("TELEGRAM_CHANNEL_ID") or 0) or 0)
+                            except Exception:
+                                channel_id = 0
+                            if token and admin_id and channel_id:
+                                start_telegram_app(token, admin_id, channel_id)
+                                if TELEGRAM_LOOP:
+                                    try:
+                                        p_row = get_paraphrase(p_id)
+                                        if not p_row or not p_row.get("sent_for_approval"):
+                                            try:
+                                                mark_paraphrase_sent_for_approval(p_id)
+                                            except Exception:
+                                                pass
+                                            asyncio.run_coroutine_threadsafe(_send_approval_message(p_id, trans_row.get("title"), paraphrased), TELEGRAM_LOOP)
+                                        else:
+                                            print(f"Paraphrase id={p_id} already sent for approval; skipping scheduling")
+                                    except Exception as e:
+                                        print("Failed to schedule telegram approval message:", e)
                     else:
                         print(f"  -> Failed to insert paraphrase for translation id={trans_id}")
             except Exception as e:
