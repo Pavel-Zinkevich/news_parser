@@ -377,19 +377,24 @@ async def main():
 
             if image_url_chan:
                 try:
-                    # Previously we sent the title as the photo caption. Keep the original call commented out
-                    # to retain the old behavior for reference, but send the photo without the caption so the
-                    # heading is not duplicated when we post the body below.
-                    # photo_msg = await safe_send_photo(context.bot, chat_id=TELEGRAM_CHANNEL_ID, photo=image_url_chan, caption=f"<b>{esc_title}</b>", parse_mode="HTML")
-                    photo_msg = await safe_send_photo(context.bot, chat_id=TELEGRAM_CHANNEL_ID, photo=image_url_chan, parse_mode="HTML")
+                    # send photo with caption as the heading; truncate caption to Telegram's 1024-char limit
+                    caption = f"<b>{esc_title}</b>"
+                    MAX_CAPTION = 1024
+                    if len(caption) > MAX_CAPTION:
+                        caption = caption[: MAX_CAPTION - 3] + "..."
+                    photo_msg = await safe_send_photo(context.bot, chat_id=TELEGRAM_CHANNEL_ID, photo=image_url_chan, caption=caption, parse_mode="HTML")
                 except Exception:
                     photo_msg = None
-                # Send only the body parts after the photo (do not resend the heading/title)
+
+                # When posting an image we do NOT send a separate heading message — the caption is the heading.
+                # Build body-only parts (exclude the title) so we don't duplicate the heading.
                 body_only = f"{esc_body}\n\n---\n\n{link_html}".strip()
-                parts_body = _split_text(body_only, TELEGRAM_MESSAGE_LIMIT)
-                for part in parts_body:
+                body_parts = _split_text(body_only, TELEGRAM_MESSAGE_LIMIT)
+
+                reply_to = photo_msg.message_id if photo_msg else None
+                for part in body_parts:
                     try:
-                        sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML", reply_to_message_id=(photo_msg.message_id if photo_msg else None))
+                        sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML", reply_to_message_id=reply_to)
                         if not sent:
                             all_sent = False
                             logger.error("Failed to send part to channel for paraphrase %s", pid)
