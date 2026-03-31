@@ -137,9 +137,9 @@ Here’s how it looks:
   <img src="./image-1.png" alt="Example screenshot" width="500"/>
 </p>
 
-<p align="center">
+<!-- <p align="center">
   <img src="./image.png" alt="News Parser Logo" width="500"/>
-</p>
+</p> -->
 
 ---
 
