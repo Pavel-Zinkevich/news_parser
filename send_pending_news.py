@@ -44,6 +44,7 @@ except Exception:
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler
 from telegram.error import TimedOut, RetryAfter
+import html
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,6 +86,22 @@ def get_pending_paraphrases(db_path: str = DB_PATH) -> List[Dict]:
         cur.execute("SELECT id, translation_id, title, url, paraphrased_text FROM paraphrases WHERE sent_for_approval = 0")
         rows = cur.fetchall()
         return [{"id": r[0], "translation_id": r[1], "title": r[2], "url": r[3], "paraphrased_text": r[4]} for r in rows]
+    finally:
+        conn.close()
+
+
+def get_translation_url(translation_id: int, db_path: str = "translation.db") -> str | None:
+    """Return the URL for the given translation id from translation.db, or None."""
+    if not translation_id:
+        return None
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT url FROM translations WHERE id = ? LIMIT 1", (translation_id,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
     finally:
         conn.close()
 
@@ -143,7 +160,22 @@ async def send_paraphrase_and_wait(bot, paraphrase: Dict, events: Dict[int, asyn
     pid = paraphrase["id"]
     title = paraphrase.get("title") or ""
     body = paraphrase.get("paraphrased_text") or ""
-    full = (title + "\n\n" + body).strip()
+    # try to get canonical url from translations DB
+    url = None
+    try:
+        url = get_translation_url(paraphrase.get("translation_id"))
+    except Exception:
+        url = paraphrase.get("url")
+    if not url:
+        url = paraphrase.get("url")
+
+    # build HTML formatted message: bold title, body, separator, clickable link
+    esc_title = html.escape(title)
+    esc_body = html.escape(body)
+    esc_url = html.escape(url or "", quote=True)
+    link_html = f'<a href="{esc_url}">🔗 Link to article</a>' if esc_url else ''
+
+    full = f"<b>{esc_title}</b>\n\n{esc_body}\n\n---\n\n{link_html}".strip()
     parts = _split_text(full, TELEGRAM_MESSAGE_LIMIT)
 
     kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pid}"), InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pid}")]]
@@ -153,16 +185,17 @@ async def send_paraphrase_and_wait(bot, paraphrase: Dict, events: Dict[int, asyn
         # send first part with buttons
         try:
             if parts:
-                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=parts[0], reply_markup=reply_markup)
-                # send remaining parts without buttons, reply to first message for threading
+                # first part - include reply_markup and parse_mode=HTML
+                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=parts[0], reply_markup=reply_markup, parse_mode="HTML")
+                # send remaining parts without buttons; ensure parse_mode=HTML
                 for part in parts[1:]:
                     try:
-                        await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=part, reply_to_message_id=(msg.message_id if msg else None))
+                        await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=part, reply_to_message_id=(msg.message_id if msg else None), parse_mode="HTML")
                     except Exception:
                         # keep going
                         pass
             else:
-                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text="(empty)", reply_markup=reply_markup)
+                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text="(empty)", reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
             logger.exception("Failed to send approval message for %s: %s", pid, e)
             return
@@ -219,7 +252,8 @@ async def main():
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             try:
-                cur.execute("SELECT title, paraphrased_text FROM paraphrases WHERE id = ? LIMIT 1", (pid,))
+                # fetch title, paraphrased_text, translation_id and stored url (if any)
+                cur.execute("SELECT title, paraphrased_text, translation_id, url FROM paraphrases WHERE id = ? LIMIT 1", (pid,))
                 row = cur.fetchone()
             finally:
                 conn.close()
@@ -232,15 +266,31 @@ async def main():
                 ev.set()
                 return
 
-            title, paraphrased_text = row[0] or "", row[1] or ""
-            full = (title + "\n\n" + paraphrased_text).strip()
-            parts = _split_text(full, TELEGRAM_MESSAGE_LIMIT)
+            title, paraphrased_text, translation_id, stored_url = row[0] or "", row[1] or "", row[2] if len(row) > 2 else None, row[3] if len(row) > 3 else None
 
-            # send to channel; require all parts to be sent
+            # determine canonical url (prefer translation.db lookup)
+            url = None
+            try:
+                if translation_id:
+                    url = get_translation_url(translation_id)
+            except Exception:
+                url = None
+            if not url:
+                url = stored_url
+
+            # build HTML formatted message for channel: bold title, body, separator, clickable link
+            esc_title = html.escape(title)
+            esc_body = html.escape(paraphrased_text)
+            esc_url = html.escape(url or "", quote=True)
+            link_html = f'<a href="{esc_url}">🔗 Link to article</a>' if esc_url else ''
+            full_html = f"<b>{esc_title}</b>\n\n{esc_body}\n\n---\n\n{link_html}".strip()
+            parts = _split_text(full_html, TELEGRAM_MESSAGE_LIMIT)
+
+            # send to channel; require all parts to be sent (use HTML parse mode)
             all_sent = True
             for part in parts:
                 try:
-                    sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part)
+                    sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML")
                     if not sent:
                         all_sent = False
                         logger.error("Failed to send part to channel for paraphrase %s", pid)
