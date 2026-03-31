@@ -155,6 +155,54 @@ async def safe_send(bot, **kwargs):
     return None
 
 
+async def safe_send_photo(bot, **kwargs):
+    """Send a photo with retries for transient errors."""
+    max_attempts = 4
+    backoff = 0.5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await bot.send_photo(**kwargs)
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", 1)
+            logger.warning("RetryAfter from Telegram(photo), waiting %s s", wait)
+            await asyncio.sleep(wait)
+        except (TimedOut, ConnectionError) as e:
+            logger.warning("Transient error on send_photo (attempt %s/%s): %s", attempt, max_attempts, e)
+            await asyncio.sleep(backoff * attempt)
+        except Exception as e:
+            logger.exception("Failed to send photo: %s", e)
+            break
+    return None
+
+
+def get_article_image_from_translation(translation_id: int) -> str | None:
+    """Given a translation_id, return the image_url from the linked article (if present).
+
+    Looks up translations.article_id then queries articles.db for image_url.
+    """
+    if not translation_id:
+        return None
+    try:
+        conn = sqlite3.connect("translation.db")
+        cur = conn.cursor()
+        cur.execute("SELECT article_id FROM translations WHERE id = ? LIMIT 1", (translation_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        article_id = row[0]
+        if not article_id:
+            return None
+        conn2 = sqlite3.connect("articles.db")
+        cur2 = conn2.cursor()
+        cur2.execute("SELECT image_url FROM articles WHERE id = ? LIMIT 1", (article_id,))
+        r2 = cur2.fetchone()
+        conn2.close()
+        return r2[0] if r2 and r2[0] else None
+    except Exception:
+        return None
+
+
 async def send_paraphrase_and_wait(bot, paraphrase: Dict, events: Dict[int, asyncio.Event], semaphore: asyncio.Semaphore):
     """Send initial approval message and the remaining chunks, mark sent, then wait for admin decision event to be set."""
     pid = paraphrase["id"]
@@ -186,20 +234,34 @@ async def send_paraphrase_and_wait(bot, paraphrase: Dict, events: Dict[int, asyn
     reply_markup = InlineKeyboardMarkup(kb)
 
     async with semaphore:
-        # send first part with buttons
+        # attempt to fetch article image (if any) to include with approval
+        image_url = None
         try:
-            if parts:
-                # first part - include reply_markup and parse_mode=HTML
-                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=parts[0], reply_markup=reply_markup, parse_mode="HTML")
-                # send remaining parts without buttons; ensure parse_mode=HTML
-                for part in parts[1:]:
+            image_url = get_article_image_from_translation(paraphrase.get("translation_id"))
+        except Exception:
+            image_url = None
+
+        try:
+            if image_url:
+                # send photo with caption as the title (buttons attached)
+                photo_msg = await safe_send_photo(bot, chat_id=TELEGRAM_ADMIN_ID, photo=image_url, caption=f"<b>{esc_title}</b>", reply_markup=reply_markup, parse_mode="HTML")
+                # send remaining parts referencing the photo message
+                for part in parts:
                     try:
-                        await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=part, reply_to_message_id=(msg.message_id if msg else None), parse_mode="HTML")
+                        await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=part, reply_to_message_id=(photo_msg.message_id if photo_msg else None), parse_mode="HTML")
                     except Exception:
-                        # keep going
                         pass
             else:
-                msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text="(empty)", reply_markup=reply_markup, parse_mode="HTML")
+                # no image: send first part with buttons
+                if parts:
+                    msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=parts[0], reply_markup=reply_markup, parse_mode="HTML")
+                    for part in parts[1:]:
+                        try:
+                            await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text=part, reply_to_message_id=(msg.message_id if msg else None), parse_mode="HTML")
+                        except Exception:
+                            pass
+                else:
+                    msg = await safe_send(bot, chat_id=TELEGRAM_ADMIN_ID, text="(empty)", reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
             logger.exception("Failed to send approval message for %s: %s", pid, e)
             return
@@ -306,19 +368,48 @@ async def main():
             full_html = f"<b>{esc_title}</b>\n\n{esc_body}\n\n---\n\n{link_html}".strip()
             parts = _split_text(full_html, TELEGRAM_MESSAGE_LIMIT)
 
-            # send to channel; require all parts to be sent (use HTML parse mode)
+            # send to channel; include image if present
             all_sent = True
-            for part in parts:
+            try:
+                image_url_chan = get_article_image_from_translation(translation_id)
+            except Exception:
+                image_url_chan = None
+
+            if image_url_chan:
                 try:
-                    sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML")
-                    if not sent:
+                    # Previously we sent the title as the photo caption. Keep the original call commented out
+                    # to retain the old behavior for reference, but send the photo without the caption so the
+                    # heading is not duplicated when we post the body below.
+                    # photo_msg = await safe_send_photo(context.bot, chat_id=TELEGRAM_CHANNEL_ID, photo=image_url_chan, caption=f"<b>{esc_title}</b>", parse_mode="HTML")
+                    photo_msg = await safe_send_photo(context.bot, chat_id=TELEGRAM_CHANNEL_ID, photo=image_url_chan, parse_mode="HTML")
+                except Exception:
+                    photo_msg = None
+                # Send only the body parts after the photo (do not resend the heading/title)
+                body_only = f"{esc_body}\n\n---\n\n{link_html}".strip()
+                parts_body = _split_text(body_only, TELEGRAM_MESSAGE_LIMIT)
+                for part in parts_body:
+                    try:
+                        sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML", reply_to_message_id=(photo_msg.message_id if photo_msg else None))
+                        if not sent:
+                            all_sent = False
+                            logger.error("Failed to send part to channel for paraphrase %s", pid)
+                            break
+                    except Exception as e:
+                        logger.exception("Error sending part to channel for %s: %s", pid, e)
                         all_sent = False
-                        logger.error("Failed to send part to channel for paraphrase %s", pid)
                         break
-                except Exception as e:
-                    logger.exception("Error sending part to channel for %s: %s", pid, e)
-                    all_sent = False
-                    break
+            else:
+                for part in parts:
+                    try:
+                        sent = await safe_send(context.bot, chat_id=TELEGRAM_CHANNEL_ID, text=part, parse_mode="HTML")
+                        if not sent:
+                            all_sent = False
+                            logger.error("Failed to send part to channel for paraphrase %s", pid)
+                            break
+                    except Exception as e:
+                        logger.exception("Error sending part to channel for %s: %s", pid, e)
+                        all_sent = False
+                        break
 
             if all_sent:
                 # mark approved in DB

@@ -348,6 +348,39 @@ def process_free_articles(articles, use_selenium=False):
 
         soup = BeautifulSoup(html, "lxml")
 
+        # try to find a main image: prefer og:image meta tag, then largest <img> inside article
+        image_url = None
+        try:
+            og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+            if og and og.get("content"):
+                image_url = og.get("content").strip()
+            if not image_url:
+                # find candidate images inside article/body
+                imgs = []
+                body_candidate = soup.find(attrs={"itemprop": "articleBody"}) or soup.find("article") or soup
+                for img in body_candidate.find_all("img", src=True):
+                    src = img.get("src") or img.get("data-src")
+                    if not src:
+                        continue
+                    # normalize relative URLs
+                    full = urljoin(url, src)
+                    # approximate size by width/height attrs if present
+                    try:
+                        w = int(img.get("width") or 0)
+                    except Exception:
+                        w = 0
+                    try:
+                        h = int(img.get("height") or 0)
+                    except Exception:
+                        h = 0
+                    imgs.append((full, w * h))
+                if imgs:
+                    # pick image with largest area (best-effort)
+                    imgs.sort(key=lambda x: x[1] or 0, reverse=True)
+                    image_url = imgs[0][0]
+        except Exception:
+            image_url = None
+
         # If published_at does not include a date/time, try to extract from <time>
         # Prefer filling missing time when we have a date from URL
         try_time_fill = True
@@ -390,6 +423,7 @@ def process_free_articles(articles, use_selenium=False):
             "url": url,
             "published_at": published_at,
             "text": text,
+            "image_url": image_url,
         })
 
     if driver:
@@ -533,6 +567,79 @@ def translate_in_chunks(text: str, tokenizer, model, max_tokens: int = 500, devi
     return "\n\n".join(filter(None, translations))
 
 
+def _split_title_subtitle(s: str) -> tuple:
+    """Split a heading string into (title, subtitle).
+
+    Heuristics:
+    - If there's a newline, split there.
+    - If there's an em/en-dash separator, split on the first one.
+    - Otherwise, split at the first boundary where a lower/digit is followed by whitespace and then an uppercase (likely start of subtitle).
+    - If none applies, return (s, "").
+    """
+    if not s:
+        return "", ""
+    s = s.strip()
+    # newline
+    if "\n" in s:
+        parts = [p.strip() for p in s.split("\n", 1)]
+        return parts[0], parts[1] if len(parts) > 1 else ""
+
+    # common dash separators
+    for sep in [" — ", " – ", " - "]:
+        if sep in s:
+            a, b = [p.strip() for p in s.split(sep, 1)]
+            # require subtitle to be more than one word
+            if len(b.split()) > 1:
+                return a, b
+
+    # find transition from lowercase/digit to uppercase (French titles -> subtitle)
+    m = re.search(r"(?<=[\w\dàâçéèêëîïôûùüÿœæ])\s+(?=[A-ZÀÂÇÉÈÊËÎÏÔÛÙÜŸŒÆ])", s)
+    if m:
+        i = m.start()
+        return s[:i].strip(), s[i:].strip()
+
+    return s, ""
+
+
+def _translate_title_and_subtitle(original: str, tokenizer, model, device: str = "cpu") -> tuple:
+    """Translate title and subtitle separately and normalize punctuation/linebreaks.
+
+    Returns (translated_title, translated_subtitle) where translated_subtitle may be empty.
+    Ensures translated_title ends with a period.
+    """
+    t_part, sub_part = _split_title_subtitle(original or "")
+
+    translated_title = ""
+    translated_sub = ""
+
+    try:
+        if t_part:
+            t_inputs = tokenizer(t_part, return_tensors='pt', truncation=True)
+            if TORCH_AVAILABLE and torch.cuda.is_available() and device == 'cuda':
+                t_inputs = {k: v.to(torch.device('cuda')) for k, v in t_inputs.items()}
+            t_out = model.generate(**t_inputs, max_length=128)
+            translated_title = tokenizer.decode(t_out[0], skip_special_tokens=True).strip()
+    except Exception:
+        translated_title = (t_part or "").strip()
+
+    try:
+        if sub_part:
+            # subtitle is typically short; translate as a single chunk
+            s_inputs = tokenizer(sub_part, return_tensors='pt', truncation=True)
+            if TORCH_AVAILABLE and torch.cuda.is_available() and device == 'cuda':
+                s_inputs = {k: v.to(torch.device('cuda')) for k, v in s_inputs.items()}
+            s_out = model.generate(**s_inputs, max_length=256)
+            translated_sub = tokenizer.decode(s_out[0], skip_special_tokens=True).strip()
+    except Exception:
+        translated_sub = (sub_part or "").strip()
+
+    # Ensure title ends with proper sentence terminator
+    if translated_title and not re.search(r"[\.\?!…]$", translated_title):
+        translated_title = translated_title.rstrip() + "."
+
+    return translated_title, translated_sub
+
+
 def init_db(db_path: str = "articles.db"):
     """Create SQLite DB and articles table if not exists."""
     conn = sqlite3.connect(db_path)
@@ -544,12 +651,31 @@ def init_db(db_path: str = "articles.db"):
             title TEXT NOT NULL,
             url TEXT NOT NULL UNIQUE,
             published_at TEXT,
-            text TEXT
+            text TEXT,
+            image_url TEXT
         )
         """
     )
     conn.commit()
     conn.close()
+    # ensure image_url column exists on older DBs (migrate if necessary)
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(articles)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'image_url' not in cols:
+            cur.execute("ALTER TABLE articles ADD COLUMN image_url TEXT")
+            conn.commit()
+            print(f"Added column 'image_url' to articles DB at {db_path}")
+    except Exception as e:
+        # non-fatal; continue
+        print(f"Warning: could not ensure image_url column on {db_path}: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_translation_db(db_path: str = "translation.db"):
@@ -695,6 +821,113 @@ def translation_exists(article_id: int, url: str, db_path: str = "translation.db
     return exists
 
 
+def get_articles_without_translation(db_path_articles: str = "articles.db", db_path_translation: str = "translation.db") -> list:
+    """Return list of articles present in articles DB that have no translation row in translations DB.
+
+    Each returned dict contains: id, title, url, published_at, text, image_url
+    """
+    try:
+        conn = sqlite3.connect(db_path_articles)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT a.id, a.title, a.url, a.published_at, a.text, a.image_url
+            FROM articles a
+            LEFT JOIN translations t ON t.article_id = a.id
+            WHERE t.id IS NULL
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            {"id": r[0], "title": r[1], "url": r[2], "published_at": r[3], "text": r[4], "image_url": r[5]}
+            for r in rows
+        ]
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def translate_only_flow(args):
+    """Translate articles already present in articles DB but missing in translation DB.
+
+    Uses Helsinki-NLP/opus-mt-fr-en. Respects args.db_path and args.use_sacremoses.
+    """
+    print("Running translate-only mode: scanning articles and translating missing ones...")
+
+    articles_db = getattr(args, "db_path", "articles.db")
+    init_db(articles_db)
+    init_translation_db()
+
+    if not TRANSFORMERS_AVAILABLE:
+        print("Transformers not available; cannot translate. Install 'transformers' and restart.")
+        return
+
+    model = None
+    tokenizer = None
+    model_name = "Helsinki-NLP/opus-mt-fr-en"
+    try:
+        print(f"Loading translation model {model_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    except Exception as e:
+        print(f"Failed to load translation model: {e}")
+        return
+
+    articles = get_articles_without_translation(articles_db, "translation.db")
+    if not articles:
+        print("No untranslated articles found in articles DB.")
+        return
+
+    for a in articles:
+        art_id = a.get("id")
+        url = a.get("url")
+        title = a.get("title") or ""
+        print(f"Translating article id={art_id} url={url}")
+
+        if translation_exists(art_id, url):
+            print(f"  -> Translation already exists for article id={art_id}; skipping")
+            continue
+
+        text = a.get("text") or ""
+        if not text and not title:
+            print(f"  -> No text/title to translate for article id={art_id}; skipping")
+            continue
+
+        try:
+            translated_text = ""
+            if text:
+                translated_text = translate_in_chunks(
+                    text,
+                    tokenizer,
+                    model,
+                    max_tokens=500,
+                    device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"),
+                    use_sacremoses=getattr(args, "use_sacremoses", False),
+                )
+
+            translated_title = ""
+            if title:
+                try:
+                    translated_title, translated_sub = _translate_title_and_subtitle(title, tokenizer, model, device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"))
+                    full_title = translated_title + ("\n" + translated_sub if translated_sub else "")
+                except Exception:
+                    full_title = ""
+            else:
+                full_title = ""
+
+            ok = insert_translation(art_id, full_title, url, translated_text)
+            if ok:
+                print(f"  -> Inserted translation for article id={art_id}")
+            else:
+                print(f"  -> Failed to insert translation for article id={art_id}")
+        except Exception as e:
+            print(f"  -> Translation failed for article id={art_id}: {e}")
+
+
 def insert_translation(article_id: int, title: str, url: str, translated_text: str, db_path: str = "translation.db") -> bool:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -758,6 +991,25 @@ def init_paraphrase_db(db_path: str = "paraphrased_translation.db"):
             print(f"Column 'sent_for_approval' already exists in {db_path}")
     except Exception as e:
         print(f"Failed to ensure 'sent_for_approval' column: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # ensure articles.image_url column exists in the articles DB (if older DB without column)
+    try:
+        conn = sqlite3.connect("articles.db")
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(articles)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'image_url' not in cols:
+            cur.execute("ALTER TABLE articles ADD COLUMN image_url TEXT")
+            conn.commit()
+            print("Added column 'image_url' to articles DB at articles.db")
+    except Exception:
+        # ignore failures here; the articles DB may be a different path or not inited
+        pass
     finally:
         try:
             conn.close()
@@ -1059,8 +1311,8 @@ def insert_article(article: dict, db_path: str = "articles.db") -> bool:
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO articles (title, url, published_at, text) VALUES (?, ?, ?, ?)",
-            (article.get("title"), article.get("url"), article.get("published_at"), article.get("text")),
+            "INSERT INTO articles (title, url, published_at, text, image_url) VALUES (?, ?, ?, ?, ?)",
+            (article.get("title"), article.get("url"), article.get("published_at"), article.get("text"), article.get("image_url")),
         )
         conn.commit()
         return cur.lastrowid
@@ -1106,6 +1358,11 @@ def main():
         help="Only run the paraphrase pipeline on existing translations in translation.db and exit"
     )
     parser.add_argument(
+        "--translate",
+        action="store_true",
+        help="Translate articles present in articles.db but missing from translation.db"
+    )
+    parser.add_argument(
         "--telegram",
         action="store_true",
         help="Enable Telegram approval workflow (requires telegram token/admin/channel)"
@@ -1127,6 +1384,11 @@ def main():
     # If paraphrase-only mode requested, run paraphrase-only flow and exit
     if getattr(args, "paraphrase_only", False):
         paraphrase_only_flow(args)
+        return
+
+    # If translate-only mode requested, translate articles stored in articles.db and exit
+    if getattr(args, "translate", False):
+        translate_only_flow(args)
         return
 
     # Allow cookie to be passed via --cookie or environment variable LEMONDE_COOKIE
@@ -1209,6 +1471,22 @@ def main():
                 model = None
                 tokenizer = None
 
+        # initialize paraphrase model once (load outside the per-article loop)
+        paraphrase_model = None
+        paraphrase_tokenizer = None
+        paraphrase_model_name = "Vamsi/T5_Paraphrase_Paws"
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                print(f"Loading paraphrase model {paraphrase_model_name}...")
+                paraphrase_tokenizer = AutoTokenizer.from_pretrained(paraphrase_model_name)
+                paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(paraphrase_model_name)
+                if TORCH_AVAILABLE and torch.cuda.is_available():
+                    paraphrase_model.to(torch.device("cuda"))
+            except Exception as e:
+                print(f"Failed to load paraphrase model: {e}")
+                paraphrase_model = None
+                paraphrase_tokenizer = None
+
         for a in articles_data:
             print(f"- {a['title']} ({a['published_at']}) [{len(a['text'])} chars]")
             # determine article id (insert if new)
@@ -1246,15 +1524,14 @@ def main():
                     device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"),
                     use_sacremoses=args.use_sacremoses,
                 )
-                # translate title
+                # translate title (preserve subtitle on newline)
                 if a.get('title'):
-                    t_inputs = tokenizer(a.get('title'), return_tensors='pt', truncation=True)
-                    t_out = model.generate(**t_inputs, max_length=128)
-                    translated_title = tokenizer.decode(t_out[0], skip_special_tokens=True)
+                    translated_title, translated_sub = _translate_title_and_subtitle(a.get('title'), tokenizer, model, device=("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"))
+                    full_title = translated_title + ("\n" + translated_sub if translated_sub else "")
                 else:
-                    translated_title = ""
+                    full_title = ""
 
-                ok = insert_translation(art_id, translated_title, a.get("url"), translated_text)
+                ok = insert_translation(art_id, full_title, a.get("url"), translated_text)
                 if ok:
                     print(f"  -> Inserted translation for article id={art_id}")
                 else:
@@ -1283,23 +1560,7 @@ def main():
                     print(f"  -> No translated text found for translation id={trans_id}; skipping paraphrase")
                     continue
 
-                # initialize paraphrase model lazily
-                paraphrase_model = None
-                paraphrase_tokenizer = None
-                paraphrase_model_name = "Vamsi/T5_Paraphrase_Paws"
-                if TRANSFORMERS_AVAILABLE:
-                    try:
-                        print(f"  -> Loading paraphrase model {paraphrase_model_name}...")
-                        paraphrase_tokenizer = AutoTokenizer.from_pretrained(paraphrase_model_name)
-                        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(paraphrase_model_name)
-                        # move to GPU if available
-                        if TORCH_AVAILABLE and torch.cuda.is_available():
-                            paraphrase_model.to(torch.device("cuda"))
-                    except Exception as e:
-                        print(f"  -> Failed to load paraphrase model: {e}")
-                        paraphrase_model = None
-                        paraphrase_tokenizer = None
-
+                # paraphrase model loaded once outside the loop; skip if unavailable
                 if paraphrase_model is None or paraphrase_tokenizer is None:
                     print("  -> Paraphrase model unavailable; skipping paraphrase.")
                     continue
