@@ -764,6 +764,30 @@ def init_paraphrase_db(db_path: str = "paraphrased_translation.db"):
         except Exception:
             pass
 
+    # create table to store edited/paraphrased versions (admin-edits) if not exists
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS edited_paraphrases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_id INTEGER,
+                edited_title TEXT,
+                edited_text TEXT,
+                FOREIGN KEY(original_id) REFERENCES paraphrases(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to create 'edited_paraphrases' table: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def paraphrase_exists(translation_id: int, url: str, db_path: str = "paraphrased_translation.db") -> bool:
     conn = sqlite3.connect(db_path)
@@ -829,6 +853,47 @@ def get_paraphrase(paraphrase_id: int, db_path: str = "paraphrased_translation.d
     if not row:
         return None
     return {"id": row[0], "translation_id": row[1], "title": row[2], "url": row[3], "paraphrased_text": row[4], "approved": row[5], "sent_for_approval": row[6]}
+
+
+def insert_edited_paraphrase(original_id: int, edited_title: str, edited_text: str, db_path: str = "paraphrased_translation.db") -> int | None:
+    """Insert an edited version of a paraphrase into edited_paraphrases.
+
+    Returns the new row id on success, or None on failure.
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO edited_paraphrases (original_id, edited_title, edited_text) VALUES (?, ?, ?)",
+            (original_id, edited_title, edited_text),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        # attempt to fail gracefully
+        return None
+    finally:
+        conn.close()
+
+
+def get_edited_for(original_id: int, db_path: str = "paraphrased_translation.db") -> list:
+    """Return a list of edited_paraphrases rows for the given original_id, newest first.
+
+    Each item is a dict: {id, original_id, edited_title, edited_text}
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, original_id, edited_title, edited_text FROM edited_paraphrases WHERE original_id = ? ORDER BY id DESC",
+            (original_id,),
+        )
+        rows = cur.fetchall()
+        return [{"id": r[0], "original_id": r[1], "edited_title": r[2], "edited_text": r[3]} for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
 
 def _chunk_text_by_chars(text: str, min_size: int = 200, max_size: int = 500):

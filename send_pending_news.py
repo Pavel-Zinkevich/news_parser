@@ -42,7 +42,7 @@ except Exception:
     raise SystemExit("TELEGRAM_ADMIN_ID and TELEGRAM_CHANNEL_ID must be integers")
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.error import TimedOut, RetryAfter
 import html
 
@@ -178,7 +178,11 @@ async def send_paraphrase_and_wait(bot, paraphrase: Dict, events: Dict[int, asyn
     full = f"<b>{esc_title}</b>\n\n{esc_body}\n\n---\n\n{link_html}".strip()
     parts = _split_text(full, TELEGRAM_MESSAGE_LIMIT)
 
-    kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pid}"), InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pid}")]]
+    kb = [[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{pid}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{pid}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject:{pid}")
+    ]]
     reply_markup = InlineKeyboardMarkup(kb)
 
     async with semaphore:
@@ -227,6 +231,8 @@ async def main():
 
     # events to wait for admin decisions
     events: Dict[int, asyncio.Event] = {}
+    # pending edit requests: maps admin user id -> paraphrase id they're editing
+    pending_edits: Dict[int, int] = {}
 
     # callback handler nested so it closes over events and db functions
     async def _callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,6 +273,20 @@ async def main():
                 return
 
             title, paraphrased_text, translation_id, stored_url = row[0] or "", row[1] or "", row[2] if len(row) > 2 else None, row[3] if len(row) > 3 else None
+
+            # If there's an edited version, prefer the latest edited_title/edited_text
+            try:
+                conn2 = sqlite3.connect(DB_PATH)
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT edited_title, edited_text FROM edited_paraphrases WHERE original_id = ? ORDER BY id DESC LIMIT 1", (pid,))
+                er = cur2.fetchone()
+                conn2.close()
+                if er and (er[0] or er[1]):
+                    title = er[0] or title
+                    paraphrased_text = er[1] or paraphrased_text
+            except Exception:
+                # ignore and fallback to original paraphrase
+                pass
 
             # determine canonical url (prefer translation.db lookup)
             url = None
@@ -338,7 +358,103 @@ async def main():
                 pass
             ev.set()
 
+        elif action == "edit":
+            # Store paraphrase id in memory for the admin and prompt for edited text
+            admin_id = update.effective_user.id if update.effective_user else None
+            if admin_id is None:
+                try:
+                    await update.callback_query.answer("Unable to identify you")
+                except Exception:
+                    pass
+                return
+
+            pending_edits[admin_id] = pid
+            try:
+                await update.callback_query.answer("Send the edited text now")
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=("Please send the edited version now.\n\n"
+                          "- The first paragraph will be used as the heading.\n"
+                          "- Separate paragraphs with Shift+Enter.\n"
+                          "- Do NOT include the article link or a '---' divider — these will be added automatically when posting."),
+                )
+            except Exception:
+                pass
+            return
+
     app.add_handler(CallbackQueryHandler(_callback_router))
+
+    # Message handler to capture edited text from admin after they pressed ✏️ Edit
+    async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message:
+            return
+        user = update.message.from_user
+        if not user:
+            return
+        uid = user.id
+        # only accept from the configured admin
+        if uid != TELEGRAM_ADMIN_ID:
+            return
+
+        # check if this admin has a pending edit request
+        pid = pending_edits.get(uid)
+        if not pid:
+            return
+
+        text = update.message.text or ""
+        if not text.strip():
+            await update.message.reply_text("Empty message — please send the edited text, with the first paragraph as heading.")
+            return
+
+        import re
+        # split paragraphs by blank line; fallback to single-newline splits
+        paragraphs = re.split(r"\n\s*\n", text.strip())
+        if len(paragraphs) == 1:
+            paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+
+        if not paragraphs:
+            await update.message.reply_text("Could not parse paragraphs — please separate paragraphs with Shift+Enter (blank line).")
+            return
+
+        edited_title = paragraphs[0].strip()
+        edited_body_parts = paragraphs[1:]
+
+        # remove any lines that look like links or dividers from the edited body
+        cleaned_parts = []
+        for part in edited_body_parts:
+            lines = [ln for ln in part.splitlines() if ln.strip() and 'http' not in ln and '🔗' not in ln and '---' not in ln]
+            if lines:
+                cleaned_parts.append('\n'.join(lines))
+
+        edited_text = '\n\n'.join(cleaned_parts).strip()
+
+        # Insert into DB
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("INSERT INTO edited_paraphrases (original_id, edited_title, edited_text) VALUES (?, ?, ?)", (pid, edited_title, edited_text))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.exception("Failed to save edited_paraphrase for %s: %s", pid, e)
+            try:
+                await update.message.reply_text("Failed to save edited version — see logs.")
+            except Exception:
+                pass
+            pending_edits.pop(uid, None)
+            return
+
+        # acknowledge and clear pending state
+        try:
+            await update.message.reply_text("Edited version saved. Press ✅ Approve to post the edited version, or ✏️ Edit again to submit another revision.")
+        except Exception:
+            pass
+        pending_edits.pop(uid, None)
+
+    app.add_handler(MessageHandler(filters.User(TELEGRAM_ADMIN_ID) & (~filters.COMMAND), _message_router))
 
     # start the app (non-blocking) and start polling so callbacks are received
     await app.initialize()
